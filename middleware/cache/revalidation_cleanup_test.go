@@ -157,8 +157,10 @@ func Test_Cache_UncacheableVaryCleanup(t *testing.T) {
 	}
 }
 
-// A reload that lands on an error page must not purge the entry or the
-// manifest its sibling variants hang on; a cacheable status still does.
+// A reload that lands on an error page must not purge the entry or the manifest
+// its sibling variants hang on; a cacheable status still does. A 401, 403 or 407
+// ends the entry the reload revalidated and leaves the manifest, since no credential
+// is in the key.
 func Test_Cache_UncacheableStatusKeepsEntryAndManifest(t *testing.T) {
 	t.Parallel()
 
@@ -166,14 +168,19 @@ func Test_Cache_UncacheableStatusKeepsEntryAndManifest(t *testing.T) {
 		name      string
 		directive string
 		status    int
-		purged    bool
+		purged    bool // the entry and the manifest go, so no variant is a hit afterwards
+		ended     bool // the refused entry goes, and the manifest and its siblings stay
 	}{
 		{name: "503", status: fiber.StatusServiceUnavailable},
 		{name: "503 no-store", status: fiber.StatusServiceUnavailable, directive: "no-store"},
 		{name: "503 private", status: fiber.StatusServiceUnavailable, directive: "private"},
 		{name: "503 no-cache", status: fiber.StatusServiceUnavailable, directive: "no-cache"},
 		{name: "503 VaryStar", status: fiber.StatusServiceUnavailable, directive: "VaryStar"},
-		{name: "401 private", status: fiber.StatusUnauthorized, directive: "private"},
+		{name: "429 no-store", status: fiber.StatusTooManyRequests, directive: "no-store"},
+		{name: "401", status: fiber.StatusUnauthorized, ended: true},
+		{name: "403", status: fiber.StatusForbidden, ended: true},
+		{name: "407", status: fiber.StatusProxyAuthRequired, ended: true},
+		{name: "401 private", status: fiber.StatusUnauthorized, directive: "private", ended: true},
 		{name: "404 no-store", status: fiber.StatusNotFound, directive: "no-store", purged: true},
 	}
 
@@ -230,15 +237,18 @@ func Test_Cache_UncacheableStatusKeepsEntryAndManifest(t *testing.T) {
 					require.Equal(t, answer.status, status)
 					require.Equal(t, cacheUnreachable, cacheStatus)
 
-					want := cacheHit
-					if answer.purged {
-						want = cacheMiss
+					wantSibling, wantReloaded := cacheHit, cacheHit
+					switch {
+					case answer.purged:
+						wantSibling, wantReloaded = cacheMiss, cacheMiss
+					case answer.ended:
+						wantReloaded = cacheMiss
 					}
 					// Sibling first: a miss on a would store the manifest again.
-					for _, variant := range []string{"b", "a"} {
-						_, cacheStatus = request(variant, "")
-						require.Equal(t, want, cacheStatus)
-					}
+					_, cacheStatus = request("b", "")
+					require.Equal(t, wantSibling, cacheStatus)
+					_, cacheStatus = request("a", "")
+					require.Equal(t, wantReloaded, cacheStatus)
 				})
 			}
 		}

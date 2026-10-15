@@ -189,7 +189,7 @@ func Test_EscapeKeyDelimiters_AppendFormsMatch(t *testing.T) {
 func Test_Cache_KeyFormatIsStable(t *testing.T) {
 	t.Parallel()
 
-	authHash := string(appendAuthHash(nil, [][]byte{[]byte("Bearer token")}))
+	authHash := authDigest("Bearer token")
 
 	tests := []struct {
 		name        string
@@ -199,17 +199,17 @@ func Test_Cache_KeyFormatIsStable(t *testing.T) {
 	}{
 		{
 			name: "anonymous",
-			want: []string{"v4|GET|/demo|vary", "v4|GET|/demo"},
+			want: []string{"v5|GET|/demo|vary", "v5|GET|/demo"},
 		},
 		{
 			name: "authenticated",
 			auth: "Bearer token",
-			want: []string{"v4|GET|/demo|auth=" + authHash + "|vary", "v4|GET|/demo|auth=" + authHash},
+			want: []string{"v5|GET|/demo|auth=" + authHash + "|vary", "v5|GET|/demo|auth=" + authHash},
 		},
 		{
 			name:        "vary disabled",
 			disableVary: true,
-			want:        []string{"v4|GET|/demo"},
+			want:        []string{"v5|GET|/demo"},
 		},
 	}
 
@@ -340,4 +340,64 @@ func boundKeySegment(segment string) string {
 	}
 	hash := sha256.Sum256(utils.UnsafeBytes(segment))
 	return hashPrefix + hex.EncodeToString(hash[:])
+}
+
+// A header whose values are hashed (a credential, or lines too long to key verbatim) and
+// one whose values are kept can never be mistaken for one another, so a value spelled
+// like a digest cannot borrow the partition of the credential it imitates. The count
+// comes first, and only a kept value is preceded by the separator.
+func Test_appendCanonicalHeaderSubset_HashedAndVerbatimSegmentsDiffer(t *testing.T) {
+	t.Parallel()
+
+	segment := func(credentials []string, lines ...string) string {
+		var h fasthttp.RequestHeader
+		for _, line := range lines {
+			h.Add("X-Api-Key", line)
+		}
+		return string(appendCanonicalHeaderSubset(nil, &h, []string{"x-api-key"}, credentials, true))
+	}
+	credential := []string{"x-api-key"}
+
+	t.Run("a credential is hashed and not spelled out", func(t *testing.T) {
+		t.Parallel()
+
+		got := segment(credential, "tok")
+		require.Equal(t, "x-api-key:1sha256:"+authDigest("tok"), got)
+		require.NotContains(t, got, "tok")
+	})
+
+	t.Run("an absent credential keeps the key of a client that sends none", func(t *testing.T) {
+		t.Parallel()
+
+		require.Equal(t, "x-api-key:0", segment(credential))
+		require.Equal(t, segment(nil), segment(credential))
+	})
+
+	t.Run("a value spelled like the digest is kept, not mistaken for the credential", func(t *testing.T) {
+		t.Parallel()
+
+		lookalike := "sha256:" + authDigest("tok")
+		got := segment(nil, lookalike)
+		require.NotEqual(t, segment(credential, "tok"), got)
+		require.True(t, strings.HasPrefix(got, "x-api-key:1|"), "a kept value follows the separator: %q", got)
+		// And under a config that hashes the header, the lookalike is just another credential.
+		require.NotEqual(t, segment(credential, "tok"), segment(credential, lookalike))
+	})
+
+	t.Run("lines too long to keep hash like a credential of the same lines", func(t *testing.T) {
+		t.Parallel()
+
+		long := strings.Repeat("x", 300)
+		want := "x-api-key:1sha256:" + authDigest(long)
+		require.Equal(t, want, segment(nil, long))
+		require.Equal(t, want, segment(credential, long))
+	})
+
+	t.Run("the split into lines is part of the digest", func(t *testing.T) {
+		t.Parallel()
+
+		require.NotEqual(t, segment(credential, "ab"), segment(credential, "a", "b"))
+		require.NotEqual(t, segment(credential, "a", "bc"), segment(credential, "ab", "c"))
+		require.NotEqual(t, segment(credential, ""), segment(credential), "present but empty differs from absent")
+	})
 }

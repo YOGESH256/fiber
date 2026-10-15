@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"container/heap"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"math"
 	"strings"
@@ -368,24 +370,39 @@ func Test_secondsConversions_Overflow(t *testing.T) {
 	require.Equal(t, 5*time.Second, secondsToDuration(5))
 }
 
+// authDigest is what appendAuthHash makes of the lines.
+func authDigest(lines ...string) string {
+	framed := make([][]byte, len(lines))
+	for i, line := range lines {
+		framed[i] = []byte(line)
+	}
+	return string(appendAuthHash(nil, framed))
+}
+
 func Test_appendAuthHash(t *testing.T) {
 	t.Parallel()
 
-	fn := func(lines [][]byte) string {
-		return string(appendAuthHash(nil, lines))
-	}
-	got := fn([][]byte{[]byte("Bearer token")})
+	got := authDigest("Bearer token")
 	require.Len(t, got, hexLen)
 	// Stable for the same input, and reuses the pooled framing buffer on the
 	// second call.
-	require.Equal(t, got, fn([][]byte{[]byte("Bearer token")}))
+	require.Equal(t, got, authDigest("Bearer token"))
 
 	// Appended to whatever the caller is already building, not returned alone.
 	require.Equal(t, "key|auth="+got, string(appendAuthHash([]byte("key|auth="), [][]byte{[]byte("Bearer token")})))
 
 	// Length-prefixed, so a split that concatenates to the same bytes does not
-	// land on the same digest.
-	require.NotEqual(t, fn([][]byte{[]byte("ab")}), fn([][]byte{[]byte("a"), []byte("b")}))
+	// land on the same digest: what keeps an Authorization, a credential header or
+	// a key dimension too long to store verbatim from sharing a key with another.
+	require.NotEqual(t, authDigest("ab"), authDigest("a", "b"))
+	require.NotEqual(t, authDigest("a", "bc"), authDigest("ab", "c"))
+	require.NotEqual(t, authDigest(""), authDigest(), "absent and present-empty are different")
+	require.NotEqual(t, authDigest("", ""), authDigest(""))
+	// A line that spells its own framing cannot fake a boundary.
+	require.NotEqual(t, authDigest("\x01a\x01b"), authDigest("a", "b"))
+	// The framing itself: a uvarint length before each line.
+	sum := sha256.Sum256([]byte("\x01a\x01b"))
+	require.Equal(t, hex.EncodeToString(sum[:]), authDigest("a", "b"))
 }
 
 func Test_manager_get_StorageErrors(t *testing.T) {
